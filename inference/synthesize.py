@@ -17,8 +17,50 @@ from pypinyin import pinyin, Style
 
 from utils.model import get_model, get_vocoder
 from utils.tools import to_device, synth_samples
-from dataset import TextDataset
 from text import text_to_sequence
+
+
+class TextDataset:
+    """文本数据集（用于批量推理）"""
+    def __init__(self, filepath, preprocess_config):
+        self.preprocess_config = preprocess_config
+        self.basename = []
+        self.speaker = []
+        self.text = []
+        self.raw_text = []
+        
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) >= 3:
+                    self.basename.append(parts[0])
+                    self.speaker.append(int(parts[1]))
+                    self.raw_text.append(parts[2])
+                    if preprocess_config["preprocessing"]["text"]["language"] == "en":
+                        self.text.append(preprocess_english(parts[2], preprocess_config))
+                    elif preprocess_config["preprocessing"]["text"]["language"] == "zh":
+                        self.text.append(preprocess_mandarin(parts[2], preprocess_config))
+    
+    def __len__(self):
+        return len(self.text)
+    
+    def __getitem__(self, idx):
+        return self.basename[idx], self.speaker[idx], self.text[idx], self.raw_text[idx]
+    
+    def collate_fn(self, batch):
+        basenames = [b[0] for b in batch]
+        speakers = np.array([b[1] for b in batch])
+        texts = [b[2] for b in batch]
+        raw_texts = [b[3] for b in batch]
+        text_lens = np.array([len(t) for t in texts])
+        
+        # Pad texts
+        max_len = max(text_lens)
+        padded_texts = np.zeros((len(texts), max_len), dtype=np.int64)
+        for i, t in enumerate(texts):
+            padded_texts[i, :len(t)] = t
+        
+        return basenames, raw_texts, speakers, padded_texts, text_lens, max_len
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
