@@ -164,8 +164,7 @@ def inference_onnx(
         print("\n使用声码器生成音频...")
         try:
             import torch
-            from utils.model import get_vocoder
-            from utils.tools import vocoder_infer
+            from utils.model import get_vocoder, vocoder_infer
             
             # 加载配置
             with open("config/AISHELL3/model.yaml", "r") as f:

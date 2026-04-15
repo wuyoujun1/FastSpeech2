@@ -166,8 +166,7 @@ def inference_tensorrt_onnx(
     print("\n  使用声码器生成音频...")
     try:
         import torch
-        from utils.model import get_vocoder
-        from utils.tools import vocoder_infer
+        from utils.model import get_vocoder, vocoder_infer
         import soundfile as sf
         
         # 加载模型配置
