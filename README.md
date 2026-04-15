@@ -35,6 +35,41 @@ unzip -o hifigan/generator_universal.pth.tar.zip -d hifigan/
 
 ## 使用方法
 
+### 方法零：API 服务（推荐）
+
+启动 API 服务：
+```bash
+python api/tts_service.py
+```
+
+服务启动后访问 http://127.0.0.1:8000
+
+**API 端点：**
+
+```bash
+# PyTorch 推理
+curl -X POST "http://127.0.0.1:8000/tts/pth" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "你好世界"}'
+
+# ONNX 推理
+curl -X POST "http://127.0.0.1:8000/tts/onnx" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "你好世界"}'
+```
+
+返回示例：
+```json
+{
+  "success": true,
+  "message": "合成成功",
+  "audio_path": "api_output/onnx_e94f0bfa.wav",
+  "duration": 1.42
+}
+```
+
+---
+
 ### 方法一：PyTorch 推理
 
 ```bash

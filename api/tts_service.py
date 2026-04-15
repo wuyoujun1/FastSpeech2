@@ -1,238 +1,377 @@
 #!/usr/bin/env python3
 """
-TTS 服务 - 常驻内存，直接调用
-
-使用方法：
-    1. 启动服务（只执行一次）：
-       python3 tts_service.py
-    
-    2. 在另一个 Python 程序中调用：
-       from tts_service import speak
-       speak("你好世界")
+FastSpeech2 TTS API 服务
+支持 PyTorch 和 ONNX 两种推理方式
 """
+
 import os
 import sys
-import yaml
 import io
+import base64
+import tempfile
 import threading
+from pathlib import Path
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# 添加项目根目录到路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import yaml
 import torch
 import numpy as np
-import wave
-import subprocess
+import soundfile as sf
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+from pydantic import BaseModel
+import uvicorn
 
-from synthesize_tensorrt_fixed import (
-    TensorRTInference, preprocess_mandarin, synthesize_segment, device
-)
-from utils.model import get_vocoder
+# 导入 TTS 相关模块
+from text import text_to_sequence
+from pypinyin import pinyin, Style
+import re
+
+
+app = FastAPI(title="FastSpeech2 TTS API", version="1.0.0")
+
 
 # ==================== 配置 ====================
 PREPROCESS_CONFIG = "config/AISHELL3/preprocess.yaml"
 MODEL_CONFIG = "config/AISHELL3/model.yaml"
-ENGINE_PATH = "fastspeech2_py.engine"
-MAX_SEQ_LEN = 50
-
-# ==================== 全局变量（服务状态）====================
-_service = None
-_lock = threading.Lock()
+CKPT_PATH = "output/ckpt/AISHELL3/600000.pth.tar"
+ONNX_PATH = "onnx/fastspeech2_tensorrt.onnx"
+SPEAKER_ID = 0
 
 
+# ==================== 文本预处理 ====================
+def read_lexicon(lex_path):
+    """读取词典文件"""
+    lexicon = {}
+    with open(lex_path, encoding='utf-8') as f:
+        for line in f:
+            temp = re.split(r"\s+", line.strip("\n"))
+            word = temp[0]
+            phones = temp[1:]
+            if word.lower() not in lexicon:
+                lexicon[word.lower()] = phones
+    return lexicon
+
+
+def preprocess_mandarin(text, preprocess_config):
+    """预处理中文文本"""
+    lexicon = read_lexicon(preprocess_config["path"]["lexicon_path"])
+    
+    phones = []
+    pinyins = [
+        p[0]
+        for p in pinyin(
+            text, style=Style.TONE3, strict=False, neutral_tone_with_five=True
+        )
+    ]
+    for p in pinyins:
+        if p in lexicon:
+            phones += lexicon[p]
+        else:
+            phones.append("sp")
+    
+    phones = "{" + " ".join(phones) + "}"
+    sequence = np.array(
+        text_to_sequence(
+            phones, preprocess_config["preprocessing"]["text"]["text_cleaners"]
+        )
+    )
+    return sequence
+
+
+# ==================== TTS 服务类 ====================
 class TTSService:
-    """TTS服务类 - 只初始化一次"""
+    """TTS 服务管理类"""
     
     def __init__(self):
-        self.trt = None
+        self.pytorch_model = None
         self.vocoder = None
+        self.onnx_session = None
         self.config = None
-        self.sample_rate = 22050
-        self.initialized = False
+        self.preprocess_config = None
+        self.model_config = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._lock = threading.Lock()
         
-    def init(self):
-        """初始化模型"""
-        if self.initialized:
+    def load_pytorch_model(self):
+        """加载 PyTorch 模型"""
+        if self.pytorch_model is not None:
             return
             
-        print("=" * 50)
-        print("正在加载 TTS 模型...")
+        print("[TTS] 加载 PyTorch 模型...")
         
         # 加载配置
-        with open(PREPROCESS_CONFIG, "r") as f:
-            self.config = yaml.load(f, Loader=yaml.FullLoader)
-        with open(MODEL_CONFIG, "r") as f:
-            model_config = yaml.load(f, Loader=yaml.FullLoader)
-        self.sample_rate = self.config["preprocessing"]["audio"]["sampling_rate"]
+        with open(PREPROCESS_CONFIG, "r", encoding='utf-8') as f:
+            self.preprocess_config = yaml.load(f, Loader=yaml.FullLoader)
+        with open(MODEL_CONFIG, "r", encoding='utf-8') as f:
+            self.model_config = yaml.load(f, Loader=yaml.FullLoader)
         
-        # 加载声码器和TensorRT
-        print("  加载声码器...")
-        self.vocoder = get_vocoder(model_config, device)
+        # 加载模型
+        from model.fastspeech2 import FastSpeech2
+        from utils.model import get_vocoder
         
-        print("  加载 TensorRT 引擎...")
-        self.trt = TensorRTInference(ENGINE_PATH, self.config)
+        self.pytorch_model = FastSpeech2(self.preprocess_config, self.model_config).to(self.device)
         
-        self.initialized = True
-        print("✅ TTS 模型加载完成！")
-        print("=" * 50)
+        ckpt = torch.load(CKPT_PATH, map_location=self.device)
+        self.pytorch_model.load_state_dict(ckpt["model"])
+        self.pytorch_model.eval()
         
-    def synthesize(self, text, speaker_id=0):
-        """合成音频，返回WAV字节数据"""
-        with _lock:  # 线程安全
-            if not self.initialized:
-                self.init()
+        # 加载声码器
+        self.vocoder = get_vocoder(self.model_config, self.device)
+        
+        print("[TTS] PyTorch 模型加载完成")
+    
+    def load_onnx_model(self):
+        """加载 ONNX 模型"""
+        if self.onnx_session is not None:
+            return
             
-            # 文本预处理
-            sequence = preprocess_mandarin(text, self.config)
-            if len(sequence) == 0:
-                print("警告：音素序列为空")
-                return None
-            
-            # 分段合成
-            if len(sequence) > MAX_SEQ_LEN:
-                wavs = []
-                for i in range(0, len(sequence), MAX_SEQ_LEN):
-                    segment = sequence[i:i+MAX_SEQ_LEN]
-                    original_len = len(segment)
-                    wav = synthesize_segment(
-                        self.trt, segment, speaker_id, MAX_SEQ_LEN, 
-                        self.vocoder, original_len
-                    )
-                    wavs.append(wav)
-                wav = np.concatenate(wavs)
-            else:
-                original_len = len(sequence)
-                wav = synthesize_segment(
-                    self.trt, sequence, speaker_id, MAX_SEQ_LEN,
-                    self.vocoder, original_len
-                )
-            
-            # 转WAV格式
-            wav = wav.astype(np.float32)
-            max_val = np.max(np.abs(wav))
-            if max_val > 1.0:
-                wav = wav / max_val
-            wav_int16 = (wav * 32767).astype(np.int16)
-            
-            buf = io.BytesIO()
-            with wave.open(buf, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(wav_int16.tobytes())
-            
-            return buf.getvalue()
+        print("[TTS] 加载 ONNX 模型...")
+        
+        import onnxruntime as ort
+        
+        # 加载配置
+        with open(PREPROCESS_CONFIG, "r", encoding='utf-8') as f:
+            self.preprocess_config = yaml.load(f, Loader=yaml.FullLoader)
+        with open(MODEL_CONFIG, "r", encoding='utf-8') as f:
+            self.model_config = yaml.load(f, Loader=yaml.FullLoader)
+        
+        # 加载声码器
+        from utils.model import get_vocoder
+        self.vocoder = get_vocoder(self.model_config, self.device)
+        
+        # 加载 ONNX
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
+        self.onnx_session = ort.InferenceSession(ONNX_PATH, sess_options, providers=providers)
+        
+        print("[TTS] ONNX 模型加载完成")
+    
+    def synthesize_pytorch(self, text):
+        """PyTorch 推理"""
+        with self._lock:
+            if self.pytorch_model is None:
+                self.load_pytorch_model()
+        
+        # 预处理文本
+        text_sequence = preprocess_mandarin(text, self.preprocess_config)
+        
+        # 准备输入
+        texts = torch.LongTensor([text_sequence]).to(self.device)
+        src_lens = torch.LongTensor([len(text_sequence)]).to(self.device)
+        speakers = torch.LongTensor([SPEAKER_ID]).to(self.device)
+        max_src_len = torch.LongTensor([len(text_sequence)]).to(self.device)
+        
+        # 推理
+        with torch.no_grad():
+            output = self.pytorch_model(
+                speakers, texts, src_lens, max_src_len,
+                mel_lens=None, max_mel_len=None,
+                p_targets=None, e_targets=None, d_targets=None
+            )
+        
+        mel_postnet = output[1]
+        mel_len = output[9][0]
+        
+        # 声码器生成音频
+        from utils.model import vocoder_infer
+        wavs = vocoder_infer(
+            mel_postnet[:, :mel_len, :],
+            self.vocoder,
+            self.model_config,
+            self.preprocess_config
+        )
+        
+        return wavs[0], mel_postnet[0, :mel_len, :].cpu().numpy()
+    
+    def synthesize_onnx(self, text):
+        """ONNX 推理"""
+        with self._lock:
+            if self.onnx_session is None:
+                self.load_onnx_model()
+        
+        # 预处理文本
+        text_sequence = preprocess_mandarin(text, self.preprocess_config)
+        
+        # 准备输入
+        texts = np.expand_dims(text_sequence, axis=0).astype(np.int64)
+        src_lens = np.array([len(text_sequence)], dtype=np.int64)
+        
+        # 推理
+        outputs = self.onnx_session.run(None, {
+            'texts': texts,
+            'src_lens': src_lens,
+        })
+        
+        mel_output = outputs[0]
+        mel_len = int(outputs[1][0])
+        
+        # 截取有效部分 [time, mel] -> [mel, time]
+        mel_valid = mel_output[0, :mel_len, :]
+        mel_tensor = torch.from_numpy(mel_valid).unsqueeze(0).float()  # [1, time, mel]
+        mel_tensor = mel_tensor.transpose(1, 2)  # [1, mel, time]
+        
+        # 声码器生成音频
+        from utils.model import vocoder_infer
+        wavs = vocoder_infer(
+            mel_tensor,
+            self.vocoder,
+            self.model_config,
+            self.preprocess_config
+        )
+        
+        return wavs[0], mel_valid
 
 
-def _get_service():
-    """获取服务实例（单例模式）"""
-    global _service
-    if _service is None:
-        _service = TTSService()
-        _service.init()
-    return _service
+# 全局 TTS 服务实例
+tts_service = TTSService()
 
 
-# ==================== 对外接口 ====================
+# ==================== API 模型 ====================
+class TTSRequest(BaseModel):
+    text: str
+    speaker_id: int = 0
 
-def speak(text, speaker_id=0):
+
+class TTSResponse(BaseModel):
+    success: bool
+    message: str
+    audio_path: str = None
+    duration: float = None
+
+
+# ==================== API 路由 ====================
+@app.get("/")
+def root():
+    """根路径 - 服务状态"""
+    return {
+        "service": "FastSpeech2 TTS API",
+        "version": "1.0.0",
+        "endpoints": {
+            "pth": "/tts/pth - PyTorch 推理",
+            "onnx": "/tts/onnx - ONNX 推理",
+            "health": "/health - 健康检查"
+        }
+    }
+
+
+@app.get("/health")
+def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "pytorch_loaded": tts_service.pytorch_model is not None,
+        "onnx_loaded": tts_service.onnx_session is not None
+    }
+
+
+@app.post("/tts/pth", response_model=TTSResponse)
+def tts_pytorch(request: TTSRequest):
     """
-    合成并播放语音
+    PyTorch 模型推理
     
-    参数:
-        text: 要合成的文本
-        speaker_id: 说话人ID，默认0
-    
-    返回:
-        True/False 表示是否成功
-    
-    示例:
-        speak("你好世界")
-        speak("今天天气不错", speaker_id=1)
+    - **text**: 要合成的文本（中文）
+    - **speaker_id**: 说话人ID（默认0）
     """
     try:
-        service = _get_service()
-        audio_data = service.synthesize(text, speaker_id)
+        print(f"[API] PyTorch 推理: '{request.text}'")
         
-        if audio_data is None:
-            return False
+        wav, mel = tts_service.synthesize_pytorch(request.text)
         
-        # 保存临时文件并播放
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_data)
-            tmp_file = f.name
+        # 保存音频
+        output_dir = "api_output"
+        os.makedirs(output_dir, exist_ok=True)
+        import hashlib
+        text_hash = hashlib.md5(request.text.encode()).hexdigest()[:8]
+        wav_path = os.path.join(output_dir, f"pth_{text_hash}.wav")
         
-        # 播放音频
-        subprocess.run(["aplay", tmp_file], capture_output=True)
+        sf.write(
+            wav_path,
+            wav,
+            tts_service.preprocess_config["preprocessing"]["audio"]["sampling_rate"]
+        )
         
-        # 删除临时文件
-        os.remove(tmp_file)
+        duration = len(wav) / tts_service.preprocess_config["preprocessing"]["audio"]["sampling_rate"]
         
-        return True
+        print(f"[API] 音频已保存: {wav_path}, 时长: {duration:.2f}s")
+        
+        return TTSResponse(
+            success=True,
+            message="合成成功",
+            audio_path=wav_path,
+            duration=duration
+        )
         
     except Exception as e:
-        print(f"TTS错误: {e}")
-        return False
+        print(f"[API] 错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def synthesize_to_file(text, output_file, speaker_id=0):
+@app.post("/tts/onnx", response_model=TTSResponse)
+def tts_onnx(request: TTSRequest):
     """
-    合成语音并保存到文件
+    ONNX 模型推理
     
-    参数:
-        text: 要合成的文本
-        output_file: 输出文件路径，如 "output.wav"
-        speaker_id: 说话人ID，默认0
-    
-    返回:
-        True/False 表示是否成功
-    
-    示例:
-        synthesize_to_file("你好", "hello.wav")
+    - **text**: 要合成的文本（中文）
+    - **speaker_id**: 说话人ID（默认0）
     """
     try:
-        service = _get_service()
-        audio_data = service.synthesize(text, speaker_id)
+        print(f"[API] ONNX 推理: '{request.text}'")
         
-        if audio_data is None:
-            return False
+        wav, mel = tts_service.synthesize_onnx(request.text)
         
-        with open(output_file, 'wb') as f:
-            f.write(audio_data)
+        # 保存音频
+        output_dir = "api_output"
+        os.makedirs(output_dir, exist_ok=True)
+        import hashlib
+        text_hash = hashlib.md5(request.text.encode()).hexdigest()[:8]
+        wav_path = os.path.join(output_dir, f"onnx_{text_hash}.wav")
         
-        return True
+        sf.write(
+            wav_path,
+            wav,
+            tts_service.preprocess_config["preprocessing"]["audio"]["sampling_rate"]
+        )
+        
+        duration = len(wav) / tts_service.preprocess_config["preprocessing"]["audio"]["sampling_rate"]
+        
+        print(f"[API] 音频已保存: {wav_path}, 时长: {duration:.2f}s")
+        
+        return TTSResponse(
+            success=True,
+            message="合成成功",
+            audio_path=wav_path,
+            duration=duration
+        )
         
     except Exception as e:
-        print(f"TTS错误: {e}")
-        return False
+        print(f"[API] 错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== 测试 ====================
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+    """获取音频文件"""
+    wav_path = os.path.join("api_output", filename)
+    if os.path.exists(wav_path):
+        return FileResponse(wav_path, media_type="audio/wav")
+    raise HTTPException(status_code=404, detail="文件不存在")
 
+
+# ==================== 启动 ====================
 if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print("TTS 服务测试")
-    print("=" * 50)
+    print("=" * 60)
+    print("FastSpeech2 TTS API 服务")
+    print("=" * 60)
+    print("端点:")
+    print("  - http://127.0.0.1:8000/           服务状态")
+    print("  - http://127.0.0.1:8000/health     健康检查")
+    print("  - POST /tts/pth                    PyTorch 推理")
+    print("  - POST /tts/onnx                   ONNX 推理")
+    print("=" * 60)
     
-    # 测试1：直接播放
-    print("\n测试1: 直接播放")
-    speak("你好，我是TTS服务")
-    
-    # 测试2：保存到文件
-    print("\n测试2: 保存到文件")
-    if synthesize_to_file("这是测试音频", "test.wav"):
-        print("✅ 已保存到 test.wav")
-        print("   播放: aplay test.wav")
-    
-    # 测试3：连续调用（测试速度）
-    print("\n测试3: 连续调用")
-    import time
-    texts = ["第一句话", "第二句话", "第三句话"]
-    for text in texts:
-        start = time.time()
-        speak(text)
-        print(f"  '{text}': {(time.time()-start)*1000:.0f}ms")
-    
-    print("\n" + "=" * 50)
-    print("测试完成！")
-    print("=" * 50)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
