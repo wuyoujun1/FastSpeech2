@@ -95,19 +95,24 @@ python deploy/export_tensorrt_onnx.py
 
 输出：`onnx/fastspeech2_tensorrt.onnx`
 
-**步骤 2：ONNX 推理**
+**步骤 2：ONNX 推理（直接生成音频）**
 
 ```bash
-# ONNX 推理（生成 mel 频谱）
+# CPU 模式
 python deploy/inference_tensorrt_onnx.py --text "你好世界"
 
-# 生成音频（自动截取有效部分）
-python deploy/generate_audio_from_mel.py "tensorrt_output/你好世界_mel.npy"
+# CUDA 模式（需要安装 onnxruntime-gpu）
+python deploy/inference_tensorrt_onnx.py --text "你好世界" --cuda
 ```
 
 输出文件：
-- `tensorrt_output/你好世界_mel.npy` - 梅尔频谱
 - `tensorrt_output/你好世界.wav` - 音频文件
+- `tensorrt_output/你好世界_mel.npy` - 梅尔频谱（可选）
+
+**注意**：如果生成的音频包含静音/杂音，可以使用以下命令重新生成（自动截取有效部分）：
+```bash
+python deploy/generate_audio_from_mel.py "tensorrt_output/你好世界_mel.npy"
+```
 
 ## 项目结构
 
@@ -203,8 +208,14 @@ python deploy/inference_tensorrt_onnx.py --text "你好世界" --cuda
 ```
 
 输出文件：
-- `tensorrt_output/你好世界_mel.npy` - 梅尔频谱
 - `tensorrt_output/你好世界.wav` - 音频文件
+- `tensorrt_output/你好世界_mel.npy` - 梅尔频谱（可选，用于重新生成音频）
+
+**音频质量优化**：
+如果生成的音频包含静音/杂音，可以使用以下命令重新生成（自动截取有效部分）：
+```bash
+python deploy/generate_audio_from_mel.py "tensorrt_output/你好世界_mel.npy"
+```
 
 ## 技术细节
 
