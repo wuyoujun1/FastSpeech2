@@ -86,13 +86,28 @@ python inference/synthesize.py \
 
 #### ONNX 版本
 
+**步骤 1：PTH 转 ONNX**
+
 ```bash
-# ONNX 推理
+# 导出 ONNX 模型（需要已下载 PTH 权重）
+python deploy/export_tensorrt_onnx.py
+```
+
+输出：`onnx/fastspeech2_tensorrt.onnx`
+
+**步骤 2：ONNX 推理**
+
+```bash
+# ONNX 推理（生成 mel 频谱）
 python deploy/inference_tensorrt_onnx.py --text "你好世界"
 
 # 生成音频（自动截取有效部分）
 python deploy/generate_audio_from_mel.py "tensorrt_output/你好世界_mel.npy"
 ```
+
+输出文件：
+- `tensorrt_output/你好世界_mel.npy` - 梅尔频谱
+- `tensorrt_output/你好世界.wav` - 音频文件
 
 ## 项目结构
 
@@ -126,11 +141,34 @@ FastSpeech2/
 
 ### 1. 导出 ONNX 模型
 
+**前置条件**：已下载 PTH 模型权重到 `output/ckpt/AISHELL3/600000.pth.tar`
+
+**导出脚本**：`deploy/export_tensorrt_onnx.py`
+
+这个脚本会：
+1. 加载 PyTorch 模型权重
+2. 使用 `model/modules_onnx.py` 中的 ONNX 友好版 LengthRegulator 替换原模块
+3. 导出为 ONNX 格式
+
+**运行导出**：
 ```bash
 python deploy/export_tensorrt_onnx.py
 ```
 
-输出：`onnx/fastspeech2_tensorrt.onnx`
+**输出文件**：
+- `onnx/fastspeech2_tensorrt.onnx` (约 120 MB)
+
+**技术细节**：
+原 `LengthRegulator` 使用 Python 动态循环，无法导出 ONNX。修改为矩阵操作：
+```python
+# model/modules_onnx.py
+class LengthRegulatorONNX(nn.Module):
+    def forward(self, x, duration, max_len):
+        # 使用 mask 和 cumsum 替代循环
+        mask = (positions >= start) & (positions < end)
+        output = (x_expanded * mask_expanded).sum(dim=1)
+        return output, mel_len
+```
 
 ### 2. 转换为 TensorRT（可选）
 
