@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pth.tar
+*.pt
+
+# ONNX
+*.onnx
+
+# TensorRT
+*.trt
+*.engine
+
+# Output files
+output/ckpt/*/
+!output/ckpt/.gitkeep
+output/result/*/
+!output/result/.gitkeep
+output/log/*/
+!output/log/.gitkeep
+tensorrt_output/
+*.wav
+*.npy
+*.png
+
+# Data
+preprocessed_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+temp_*/
+*.log
