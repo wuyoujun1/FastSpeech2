@@ -161,49 +161,8 @@ def inference_tensorrt_onnx(
     mel_save_path = os.path.join(output_dir, f"{text}_mel.npy")
     np.save(mel_save_path, mel_output[0])
     print(f"\n  梅尔频谱已保存: {mel_save_path}")
-    
-    # 使用声码器生成音频
-    print("\n  使用声码器生成音频...")
-    try:
-        import torch
-        from utils.model import get_vocoder, vocoder_infer
-        import soundfile as sf
-        
-        # 加载模型配置
-        with open("config/AISHELL3/model.yaml", "r") as f:
-            model_config = yaml.load(f, Loader=yaml.FullLoader)
-        
-        # 加载声码器
-        device = torch.device("cpu")
-        vocoder = get_vocoder(model_config, device)
-        
-        # 截取有效的 mel 部分
-        valid_mel_len = int(mel_len[0])
-        mel_tensor = torch.from_numpy(mel_output[:, :valid_mel_len, :]).float()
-        
-        # 生成音频
-        with torch.no_grad():
-            wavs = vocoder_infer(
-                mel_tensor,
-                vocoder,
-                model_config,
-                preprocess_config,
-            )
-        
-        # 保存音频
-        wav = wavs[0]
-        wav_path = os.path.join(output_dir, f"{text}.wav")
-        sf.write(
-            wav_path, 
-            wav, 
-            preprocess_config["preprocessing"]["audio"]["sampling_rate"]
-        )
-        print(f"  音频已保存: {wav_path}")
-        print(f"  音频时长: {len(wav) / preprocess_config['preprocessing']['audio']['sampling_rate']:.2f} 秒")
-        
-    except Exception as e:
-        print(f"  声码器推理失败: {e}")
-        print("  梅尔频谱已保存，可以使用其他声码器转换")
+    print(f"  请运行以下命令生成音频:")
+    print(f"    python deploy/generate_audio_from_mel.py \"{mel_save_path}\"")
     
     print("\n" + "=" * 70)
     print("推理完成!")
